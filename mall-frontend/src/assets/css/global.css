@@ -1,0 +1,146 @@
+/* ========== 全局样式重置 ========== */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #app {
+  width: 100%;
+  height: 100%;
+  font-family: 'Helvetica Neue', Helvetica, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', Arial, sans-serif;
+  background-color: #f6f7f9;
+  color: #1f2329;
+}
+
+a {
+  text-decoration: none;
+  color: inherit;
+}
+
+/* ========== 通用容器 ========== */
+.page-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+/* ========== 卡片通用样式 ========== */
+.page-card {
+  background: #fff;
+  border-radius: 8px;
+  padding: 22px;
+  margin-bottom: 20px;
+  border: 1px solid #ebeef2;
+  box-shadow: 0 8px 22px rgba(31, 35, 41, 0.04);
+}
+
+/* ========== 搜索栏样式 ========== */
+.search-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 20px;
+  flex-wrap: wrap;
+}
+
+/* ========== 操作按钮组 ========== */
+.action-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+/* ========== 分页样式 ========== */
+.pagination-wrapper {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 20px;
+}
+
+/* ========== 价格样式 ========== */
+.price {
+  color: #e5482f;
+  font-size: 18px;
+  font-weight: bold;
+}
+
+.price-original {
+  color: #999;
+  font-size: 13px;
+  text-decoration: line-through;
+  margin-left: 8px;
+}
+
+/* ========== 状态标签 ========== */
+.status-tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+
+.page-title {
+  color: #1f2329;
+  letter-spacing: 0;
+}
+
+.el-button--primary {
+  --el-button-bg-color: #1f2329;
+  --el-button-border-color: #1f2329;
+  --el-button-hover-bg-color: #343a43;
+  --el-button-hover-border-color: #343a43;
+  --el-button-active-bg-color: #111318;
+  --el-button-active-border-color: #111318;
+}
+
+.el-button--danger {
+  --el-button-bg-color: #e5482f;
+  --el-button-border-color: #e5482f;
+  --el-button-hover-bg-color: #f05b43;
+  --el-button-hover-border-color: #f05b43;
+}
+
+.el-button--warning {
+  --el-button-bg-color: #f26d21;
+  --el-button-border-color: #f26d21;
+  --el-button-hover-bg-color: #fb7b31;
+  --el-button-hover-border-color: #fb7b31;
+}
+
+.el-input__wrapper,
+.el-select__wrapper {
+  border-radius: 6px;
+  box-shadow: 0 0 0 1px #dde1e7 inset;
+}
+
+.el-input__wrapper:hover,
+.el-select__wrapper:hover {
+  box-shadow: 0 0 0 1px #b8bec8 inset;
+}
+
+.el-table {
+  --el-table-header-bg-color: #f7f8fa;
+  --el-table-header-text-color: #4e5969;
+  --el-table-text-color: #1f2329;
+  --el-table-border-color: #ebeef2;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.el-table th.el-table__cell {
+  font-weight: 600;
+}
+
+.el-tag {
+  border-radius: 5px;
+}
+
+@media (max-width: 768px) {
+  .page-container {
+    padding: 16px;
+  }
+
+  .page-card {
+    padding: 16px;
+  }
+}

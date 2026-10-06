@@ -1,0 +1,7 @@
+# Core versions from the existing project environment.
+Django==4.2.15
+djangorestframework==3.17.1
+djangorestframework-simplejwt==5.5.1
+django-redis==5.4.0
+PyMySQL==1.2.0
+python-dotenv>=1.0,<2.0
