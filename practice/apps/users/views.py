@@ -1,5 +1,7 @@
 import json
 import os
+from asyncio import timeout
+
 from django.utils import timezone
 from uuid import uuid4
 from datetime import timedelta
@@ -25,6 +27,7 @@ from apps.users.serializers import (
     OrdersSerializer,ReviewsSerializer,MerchantOrderSerializer,
     AdminUserSerializer, AdminProductSerializer,MerchantReviewSerializer
 )
+
 from django.utils.decorators import method_decorator
 from django.views.decorators.cache import cache_page
 
@@ -172,19 +175,22 @@ def address_detail(request, pk):
         serializer.save()
         return Response(serializer.data)
     return Response(serializer.errors, status=400)
-
 '''商品分类列表'''
+# 请求方法
 @api_view(['GET'])
-@permission_classes([AllowAny]) # 需要登录就能访问
+@permission_classes([AllowAny]) # 需要游客登录
 def categories(request):
-    cache_key = "category:tree"     # 缓存的 key（实际存成 mall:category:tree）
-    cached = cache.get(cache_key)    # 先查 Redis
-    if cached is not None:  # 命中则直接返回，不再查库
+    cache_key = "categories:tree"
+    # 获取缓存通过ID
+    cached = cache.get(cache_key)
+    if cached is not None:
         return Response(cached)
-    category_list  = ProductCategories.objects.filter(parent = None) # 只查一级分类
-    serializer  = ProductCategoriesSerializer(category_list,many=True)#  many=True 序列化多条数据
-    cache.set(cache_key, serializer.data, timeout=60 * 30)  # 未命中查库后 缓存 30 分钟
-    return  Response(serializer.data)
+    # 缓存未命中数据库获取数据
+    cache_list = ProductCategories.objects.filter(parent=None)  # 一级标题
+    serializer = ProductCategoriesSerializer(cache_list,many=True)
+    # 更新缓存
+    cache.set(cache_key,serializer.data,60*60) # 传入三个值，缓存名字，存什么内容，时间
+    return Response(serializer.data)
 '''商品分类详情'''
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -226,10 +232,16 @@ class ProductViewSet(ReadOnlyModelViewSet):
     permission_classes = [AllowAny]  # 公开商品
     # 负责“接收请求、返回商品列表”
     # 加装饰器缓存整个响应
-    @method_decorator(cache_page(60 * 5))
     def list(self,request,*args,**kwargs):
-        return super().list(request,*args,**kwargs)
-
+        # 包含分页、筛选参数，避免不同请求混用缓存
+        cache_key  = "product:list" + request.build_absolute_uri()  # 返回当前请求的URL
+        # 获取数据
+        cached = cache.get(cache_key)
+        if cached is not None:
+            return Response(cached)
+        response = super().list(request,*args,**kwargs)
+        cache.set(cache_key,response.data,timeout=60*5)
+        return response
     def get_queryset(self):
         # 1、只查上架商品                                #select_related 一次性把关联的数据都查出来
         qs = Products.objects.filter(is_active=True).select_related('category','merchant')  # is_active商品是否上架 category分类 merchant 商家
