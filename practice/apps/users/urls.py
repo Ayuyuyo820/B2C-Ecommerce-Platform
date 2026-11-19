@@ -36,7 +36,7 @@ urlpatterns = [
     # 修改和删除用户地址
     path("addresses/<int:pk>/", views.address_detail, name="address_detail"),
     # 商品分类列表
-    path("categories/",views.categories,name="categories"),
+    path("categories/",views.categories,name= "categories"),
     # 商品分类详情
     path("categories/<int:pk>/", views.detail_categories, name="detail_categories"),
     # 上传文件

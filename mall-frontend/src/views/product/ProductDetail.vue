@@ -318,18 +318,14 @@ const confirmBuyNow = async () => {
       cancelButtonText: '取消',
       type: 'info'
     })
-    // 立即购买：先加入购物车，再用购物车ID下单
-    const { data: cartData } = await request.post('/cart/', {
-      product_id: product.value.id,
-      quantity: quantity.value
-    })
     const { data: orderData } = await request.post('/orders/', {
-      cart_ids: [cartData.id],
+      product_id: product.value.id,
+      quantity: quantity.value,
       address_id: selectedAddressId.value
     })
     ElMessage.success('订单创建成功')
     addressDialogVisible.value = false
-    router.push(`/order/${orderData.id}`)
+    router.push(`/order/${orderData.orders[0].id}`)
   } catch {
     // 用户取消或请求失败
   }

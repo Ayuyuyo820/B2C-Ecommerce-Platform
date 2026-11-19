@@ -42,10 +42,13 @@
           </template>
         </el-table-column>
         <!-- 操作列 -->
-        <el-table-column label="操作" width="160" align="center" fixed="right">
+        <el-table-column label="操作" width="250" align="center" fixed="right">
           <template #default="{ row }">
             <div class="action-buttons">
               <el-button type="primary" size="small" @click="handleEdit(row)">编辑</el-button>
+              <el-button size="small" :disabled="stockAdjusting" @click="handleAdjustStock(row)">
+                调整库存
+              </el-button>
               <el-button type="danger" size="small" @click="handleDelete(row)">删除</el-button>
             </div>
           </template>
@@ -96,8 +99,9 @@
         <el-form-item label="原价" prop="original_price">
           <el-input-number v-model="productForm.original_price" :min="0" :precision="2" :step="1" />
         </el-form-item>
-        <el-form-item label="库存" prop="stock">
-          <el-input-number v-model="productForm.stock" :min="0" :step="1" />
+        <!-- 只有新增商品时设置初始库存，已有商品从列表单独调整。 -->
+        <el-form-item v-if="!isEdit" label="初始库存" prop="stock">
+          <el-input-number v-model="productForm.stock" :min="0" :step="1" :precision="0" />
         </el-form-item>
         <el-form-item label="分类" prop="category">
           <el-select v-model="productForm.category" placeholder="请选择分类" style="width: 100%">
@@ -182,6 +186,7 @@ const statusLabel = (status) => {
 const dialogVisible = ref(false)
 const isEdit = ref(false)
 const submitLoading = ref(false)
+const stockAdjusting = ref(false)
 const formRef = ref(null)
 
 // 表单数据
@@ -245,7 +250,6 @@ const handleEdit = (row) => {
     description: row.description || '',
     price: Number(row.price),
     original_price: Number(row.original_price || 0),
-    stock: row.stock,
     category: row.category?.id || '',
     images: row.images || []
   })
@@ -274,7 +278,9 @@ const submitForm = async () => {
     const payload = { ...productForm, category_id: productForm.category }
     delete payload.category
     if (isEdit.value) {
-      await request.put(`/merchant/products/${productForm.id}/`, payload)
+      // 商品资料提交不带库存，避免使用打开表单时的旧值。
+      delete payload.stock
+      await request.patch(`/merchant/products/${productForm.id}/`, payload)
       ElMessage.success('商品更新成功')
     } else {
       await request.post('/merchant/products/', payload)
@@ -286,6 +292,27 @@ const submitForm = async () => {
     // 错误已在拦截器中处理
   } finally {
     submitLoading.value = false
+  }
+}
+
+// 库存只提交增减量，后端按数据库里的当前库存计算。
+const handleAdjustStock = async (row) => {
+  if (stockAdjusting.value) return
+  stockAdjusting.value = true
+  try {
+    const { value } = await ElMessageBox.prompt('输入增减数量，例如 5 表示补货 5 件，-2 表示减少 2 件。', '调整库存', {
+      confirmButtonText: '确认调整',
+      cancelButtonText: '取消',
+      inputPattern: /^[+-]?[1-9]\d*$/,
+      inputErrorMessage: '请输入非零整数'
+    })
+    await request.post(`/merchant/products/${row.id}/adjust-stock/`, { delta: Number(value) })
+    ElMessage.success('库存调整成功')
+    await fetchProductList()
+  } catch {
+    // 用户取消或请求失败
+  } finally {
+    stockAdjusting.value = false
   }
 }
 

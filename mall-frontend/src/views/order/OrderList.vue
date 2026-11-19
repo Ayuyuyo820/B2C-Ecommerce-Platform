@@ -212,7 +212,10 @@ const goReview = (orderId) => {
 // 去支付
 const handlePay = async (order) => {
   try {
-    await ElMessageBox.confirm('确定要支付该订单吗？', '确认支付', { type: 'info' })
+    const message = order.checkout_order_count > 1
+      ? `合并支付本次结算的 ${order.checkout_order_count} 笔订单，共 ¥${order.checkout_total_amount}？`
+      : `确认支付 ¥${order.total_amount}？`
+    await ElMessageBox.confirm(message, '确认支付', { type: 'info' })
     await payOrder(order.id)
     ElMessage.success('支付成功')
     fetchOrders()
@@ -224,7 +227,10 @@ const handlePay = async (order) => {
 // 取消订单
 const handleCancel = async (order) => {
   try {
-    await ElMessageBox.confirm('确定要取消该订单吗？取消后不可恢复。', '取消订单', {
+    const message = order.checkout_order_count > 1
+      ? `确定取消本次结算的全部 ${order.checkout_order_count} 笔订单？`
+      : '确定要取消该订单吗？取消后不可恢复。'
+    await ElMessageBox.confirm(message, '取消订单', {
       type: 'warning'
     })
     await cancelOrder(order.id)

@@ -15,6 +15,9 @@
       <div class="page-card">
         <div class="section-title">订单信息</div>
         <el-descriptions :column="2" border>
+          <!-- 物流信息取自发货时保存的数据，旧订单可能为空。 -->
+          <el-descriptions-item label="物流公司">{{ order.shipping_company || "暂无物流信息" }}</el-descriptions-item>
+          <el-descriptions-item label="物流单号">{{ order.tracking_number || "暂无物流信息" }}</el-descriptions-item>
           <el-descriptions-item label="订单号">{{ order.order_no }}</el-descriptions-item>
           <el-descriptions-item label="订单状态">
             <el-tag :type="statusTagType(order.status)">
@@ -54,7 +57,7 @@
             <template #default="{ row }">
               <div class="product-cell">
                 <el-image
-                  :src="row.product?.image"
+                  :src="row.product_image"
                   fit="cover"
                   class="product-image"
                 >
@@ -64,7 +67,8 @@
                     </div>
                   </template>
                 </el-image>
-                <span class="product-name">{{ row.product?.name }}</span>
+                <!-- 读取订单项快照，商品改名或删除后仍显示购买时的资料。 -->
+                <span class="product-name">{{ row.product_name }}</span>
               </div>
             </template>
           </el-table-column>
@@ -169,16 +173,25 @@ const goBack = () => {
 
 // 跳转评价页
 const goReview = () => {
-  router.push(`/order/${order.value.id}/review`)
+  // 根据路由名和订单 ID 生成 /review/:orderId，避免手动拼错地址。
+  router.push({ name: "Review", params: { orderId: order.value.id } })
 }
 
 // 去支付
 const handlePay = async () => {
   try {
-    await ElMessageBox.confirm('确定要支付该订单吗？', '确认支付', { type: 'info' })
+    const { checkout_order_count, checkout_total_amount, total_amount } = order.value
+    const message = checkout_order_count > 1
+      ? `合并支付本次结算的 ${checkout_order_count} 笔订单，共 ¥${checkout_total_amount}？`
+      : `确认支付 ¥${total_amount}？`
+    await ElMessageBox.confirm(message, '确认支付', { type: 'info' })
     await payOrder(order.value.id)
     ElMessage.success('支付成功')
-    fetchOrder()
+    if (checkout_order_count > 1) {
+      router.push('/orders')
+    } else {
+      fetchOrder()
+    }
   } catch {
     // 用户取消或请求失败
   }
@@ -187,7 +200,10 @@ const handlePay = async () => {
 // 取消订单
 const handleCancel = async () => {
   try {
-    await ElMessageBox.confirm('确定要取消该订单吗？取消后不可恢复。', '取消订单', {
+    const message = order.value.checkout_order_count > 1
+      ? `确定取消本次结算的全部 ${order.value.checkout_order_count} 笔订单？`
+      : '确定要取消该订单吗？取消后不可恢复。'
+    await ElMessageBox.confirm(message, '取消订单', {
       type: 'warning'
     })
     await cancelOrder(order.value.id)

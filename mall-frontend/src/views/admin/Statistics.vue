@@ -38,8 +38,9 @@
       <!-- 销售数据表格 -->
       <el-table :data="salesList" v-loading="salesLoading" stripe border style="width: 100%">
         <el-table-column prop="date" label="日期" min-width="140" align="center" />
-        <el-table-column prop="orders" label="订单数" min-width="100" align="center" />
-        <el-table-column prop="amount" label="销售额" min-width="140" align="center">
+        <!-- 下单数按创建日期统计，成交额按支付日期统计。 -->
+        <el-table-column prop="orders" label="下单数" min-width="100" align="center" />
+        <el-table-column prop="amount" label="成交额" min-width="140" align="center">
           <template #default="{ row }">
             <span class="price">¥{{ row.amount }}</span>
           </template>
@@ -66,8 +67,8 @@ const stats = reactive({
 
 // 统计卡片配置
 const statCards = computed(() => [
-  { label: '今日订单数', value: stats.today_orders, icon: ShoppingCart, color: '#1f2329' },
-  { label: '今日销售额', value: `¥${stats.today_amount}`, icon: Money, color: '#e5482f' },
+  { label: '今日下单数', value: stats.today_orders, icon: ShoppingCart, color: '#1f2329' },
+  { label: '今日成交额', value: `¥${stats.today_amount}`, icon: Money, color: '#e5482f' },
   { label: '总用户数', value: stats.total_users, icon: User, color: '#4e5969' },
   { label: '总商品数', value: stats.total_products, icon: Goods, color: '#f26d21' },
   { label: '待处理订单', value: stats.pending_orders, icon: Document, color: '#6b7280' },

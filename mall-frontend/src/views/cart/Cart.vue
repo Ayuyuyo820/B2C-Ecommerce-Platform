@@ -200,7 +200,8 @@ const handleSelectAll = (val) => {
 // ========== 修改数量 ==========
 const handleQuantityChange = async (row, val) => {
   try {
-    await request.put(`/cart/${row.id}/`, { quantity: val })
+    // 仅修改数量使用 PATCH，后端保留未提交的商品和勾选状态。
+    await request.patch(`/cart/${row.id}/`, { quantity: val })
     // 更新本地数据
     row.quantity = val
   } catch {
@@ -276,10 +277,10 @@ const confirmOrder = async () => {
       cart_ids: cartIds,
       address_id: selectedAddressId.value
     })
-    ElMessage.success('订单创建成功')
+    ElMessage.success(data.orders.length > 1 ? `已按商家生成 ${data.orders.length} 笔订单` : '订单创建成功')
     addressDialogVisible.value = false
     // 跳转订单详情
-    router.push(`/order/${data.id}`)
+    router.push(`/order/${data.orders[0].id}`)
   } catch {
     // 用户取消或请求失败
   }

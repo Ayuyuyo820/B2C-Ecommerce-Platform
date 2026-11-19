@@ -135,8 +135,9 @@ const formatTime = (time) => {
 const initReviewItems = (items) => {
   reviewItems.value = items.map((item) => ({
     product_id: item.product?.id,
-    product_name: item.product?.name,
-    product_image: item.product?.image,
+    // 评价页也展示下单时保存的商品资料。
+    product_name: item.product_name,
+    product_image: item.product_image,
     price: item.price,
     quantity: item.quantity,
     rating: 5,

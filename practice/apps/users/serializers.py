@@ -58,6 +58,7 @@ class UserMeSerializer(serializers.ModelSerializer):
         '''获取/修改个人信息的序列化(不反悔密码)'''
         class Meta:
             model = UserInfo
+            read_only_fields = ["id", "role", "create_time"]
             fields = ['id', 'username', 'phone', 'email', 'role', 'avatar', 'create_time']
 
 '''用户地址模块'''
@@ -112,13 +113,46 @@ class ProductsSerializer(serializers.ModelSerializer):
         ]
         # 审核/上架/销量字段只读：只能由管理员审核流程修改，商家端不能改
         extra_kwargs = {
+            # 接口先拦截负数并返回字段错误，避免写库时才触发约束异常。
+            # 售价和库存允许为 0；原价沿用模型的可空配置，填写时必须非负。
+            # 新增与更新商品都会经过这些校验，前端输入框之外的请求也受限制。
+            "price": {"min_value": 0},
+            "original_price": {"min_value": 0},
+            "stock": {"min_value": 0},
             "is_active": {"read_only": True},
             "audit_status": {"read_only": True},
             "reject_reason": {"read_only": True},
             "sales": {"read_only": True},
         }
 
-    '''商品的精简序列化器'''
+class MerchantProductUpdateSerializer(ProductsSerializer):
+    def validate(self, attrs):
+        # 商品资料编辑与库存调整分开，防止旧表单把已扣减的库存写回去。
+        if "stock" in attrs:
+            raise serializers.ValidationError({"stock": "请通过调整库存操作修改库存"})
+        return attrs
+
+    def update(self, instance, validated_data):
+        if validated_data:
+            for field, value in validated_data.items():
+                setattr(instance, field, value)
+            # 只写校验通过的资料字段，避免覆盖并发更新的库存和审核状态。
+            instance.save(update_fields=[*validated_data, "updated_at"])
+        return instance
+
+
+class ProductStockAdjustmentSerializer(serializers.Serializer):
+    # stock 是有符号整数列，限制调整量以便后续判断调整结果是否会溢出。
+    MAX_STOCK = 2_147_483_647
+    delta = serializers.IntegerField(min_value=-MAX_STOCK, max_value=MAX_STOCK)
+
+    def validate_delta(self, value):
+        if value == 0:
+            raise serializers.ValidationError("库存调整量不能为 0")
+        return value
+
+
+'''商品的精简序列化器'''
 class ProductBriefSerializer(serializers.ModelSerializer):
     class Meta:
         model = Products
@@ -127,14 +161,36 @@ class ProductBriefSerializer(serializers.ModelSerializer):
 
 '''购物车'''
 class CartItemSerializer(serializers.ModelSerializer):
+    # 数量必须为正整数。默认数量由加购入口设置，更新省略数量时保留原值。
+    quantity = serializers.IntegerField(min_value=1, required=False)
     product = ProductBriefSerializer(read_only=True) # 只读
     product_id = serializers.PrimaryKeyRelatedField(  # PrimaryKeyRelatedField 把前端传的数字 ID，自动转换成数据库里的对象
-        queryset = Products.objects.all(),  # 根据前端ID查询商品表
+        # 加购时只接受已上架且审核通过的商品，结算仍需再次验证。
+        # PrimaryKeyRelatedField 会在校验 product_id 时执行该筛选，
+        # 下架、未审核或被拒绝的商品会返回字段校验错误。
+        queryset = Products.objects.filter(is_active=True, audit_status="approved"),
         source='product',       # 前端传 product_id，但存到模型的 product 字段里
         write_only=True         # 只管写（请求）
     )
     #  前端用 selected，映射到模型的 is_selected
     selected = serializers.BooleanField(source='is_selected', required=False)  # 前端用 selected，映射到模型的 is_selected
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance is not None:
+            # 已有购物车项通过 URL 中的 ID 定位，商品归属在新增时确定。
+            # 更新时移除商品写入字段，PUT/PATCH 都无需再次提交 product_id。
+            self.fields.pop("product_id")
+
+    def validate(self, attrs):
+        if self.instance is not None:
+            # 更新接口只接收数量和勾选状态，防止直接请求接口更换商品。
+            unsupported = set(self.initial_data) - {"quantity", "selected"}
+            if unsupported:
+                raise serializers.ValidationError({
+                    field: "仅允许修改 quantity 和 selected" for field in unsupported
+                })
+        return attrs
 
     class Meta:
         model = CartItem
@@ -144,10 +200,11 @@ class CartItemSerializer(serializers.ModelSerializer):
             'user': {'read_only': True},
         }
 '''订单项里嵌套的商品信息（比购物车的更精简）'''
-class OrderProductSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Products
-        fields = ["id","name","image"]
+class OrderProductSerializer(serializers.Serializer):
+    # 保留原来 product 对象的响应结构，名称、图片改从订单项快照读取。
+    id = serializers.IntegerField(source="product_id", read_only=True)
+    name = serializers.CharField(source="product_name", read_only=True)
+    image = serializers.CharField(source="product_image", read_only=True)
 
 '''地址精简序列化器（嵌套在订单里，返回拼接好的完整地址）'''
 class AddressBriefSerializer(serializers.ModelSerializer):
@@ -163,14 +220,20 @@ class AddressBriefSerializer(serializers.ModelSerializer):
 
 '''订单项（被嵌套在订单里，不单独使用）'''
 class OrderItemSerializer(serializers.ModelSerializer):
-    product = OrderProductSerializer(read_only=True)    # 嵌套商品信息，不只返回ID
-    product_name = serializers.CharField(source="product.name", read_only=True)  # 商品名，方便前端直接取
-    product_image = serializers.CharField(source="product.image", read_only=True)  # 商品图，方便前端直接取
+    product = serializers.SerializerMethodField()
+    # 扁平字段与嵌套对象统一读取快照，商品删除后仍能展示购买信息。
+    product_name = serializers.CharField(read_only=True)
+    product_image = serializers.CharField(read_only=True)
     subtotal = serializers.SerializerMethodField()        # 自定义字段：小计金额
 
     class Meta:
         model = OrdersItem
         fields = ["id","product","product_name","product_image","price","quantity","subtotal"]
+
+    def get_product(self, obj):
+        if obj.product_id is None:
+            return None
+        return OrderProductSerializer(obj).data
 
     def get_subtotal(self,obj):
         # obj 就是当前这条 OrdersItem 记录
@@ -182,27 +245,63 @@ class ReviewsUserSerializer(serializers.ModelSerializer):
         model = UserInfo
         fields = ["id","username","avatar"]
 
-class OrdersSerializer(serializers.ModelSerializer):
-    # 创建订单时前端传的字段（write_only 只在请求时接收，响应不返回）
+class CheckoutCreateSerializer(serializers.Serializer):
     cart_ids = serializers.ListField(
-        child=serializers.IntegerField(),  # 类型：整数列表 [1, 3]
-        write_only=True
+        child=serializers.IntegerField(min_value=1), allow_empty=False, required=False,
     )
-    address_id = serializers.PrimaryKeyRelatedField(
-        queryset=UserAddresses.objects.all(),  # 根据ID查地址表
-        source='address',  # 前端传 address_id，存到模型的 address 字段
-        write_only=True
-    )
+    product_id = serializers.IntegerField(min_value=1, required=False)
+    quantity = serializers.IntegerField(min_value=1, required=False)
+    address_id = serializers.IntegerField(min_value=1)
+    remark = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+    def validate(self, data):
+        if "cart_ids" in data:
+            if "product_id" in data or "quantity" in data:
+                raise serializers.ValidationError("购物车结算不能同时指定立即购买商品")
+        elif "product_id" not in data or "quantity" not in data:
+            raise serializers.ValidationError("立即购买需要商品和数量")
+        return data
+
+
+class OrderAddressSerializer(serializers.Field):
+    def get_attribute(self, order):
+        return order
+
+    def to_representation(self, order):
+        if order.checkout_id:
+            return order.checkout.address_snapshot
+        return order.legacy_address_snapshot
+
+
+class OrderShipSerializer(serializers.Serializer):
+    # 去除首尾空格，拒绝缺失、空白和超长的物流信息。
+    shipping_company = serializers.CharField(max_length=100, allow_blank=False)
+    tracking_number = serializers.CharField(max_length=100, allow_blank=False)
+
+
+class OrdersSerializer(serializers.ModelSerializer):
+    # 买家只读取物流信息，具体写入由商家的发货接口负责。
+    shipping_company = serializers.CharField(read_only=True)
+    tracking_number = serializers.CharField(read_only=True)
     items = OrderItemSerializer(many=True, read_only=True)   # 嵌套订单项列表
     status_display = serializers.CharField(source="get_status_display", read_only=True)  # 状态中文名（待支付/已支付等）
-    address = AddressBriefSerializer(read_only=True)  # 嵌套地址信息（含拼接好的完整地址）
+    address = OrderAddressSerializer(read_only=True)
     merchant = ReviewsUserSerializer(read_only=True)  # 嵌套商家信息
+    checkout_total_amount = serializers.DecimalField(
+        source="checkout.total_amount", max_digits=10, decimal_places=2,
+        read_only=True, default=None,
+    )
+    checkout_order_count = serializers.IntegerField(
+        source="checkout.order_count", read_only=True, default=1,
+    )
 
     class Meta:
         model = Orders
         fields = [
             "id", "order_no", "status", "status_display", "total_amount", "items",
-            "merchant", "address", "cart_ids", "address_id", "remark",
+            "merchant", "address", "remark", "checkout_id", "checkout_total_amount",
+            "checkout_order_count", "shipping_company", "tracking_number",
             "create_time", "pay_time", "ship_time", "complete_time", "is_reviewed",
         ]
         read_only_fields = ["id", "order_no", "status", "total_amount", "create_time", "pay_time"]
@@ -210,13 +309,17 @@ class OrdersSerializer(serializers.ModelSerializer):
 
 '''商家订单序列化器（字段对齐商家订单管理页）'''
 class MerchantOrderSerializer(serializers.ModelSerializer):
+    # 返回已保存的物流信息，供商家发货后核对。
+    shipping_company = serializers.CharField(read_only=True)
+    tracking_number = serializers.CharField(read_only=True)
+    address = OrderAddressSerializer(read_only=True)
     username = serializers.CharField(source="user.username", read_only=True)  # 下单用户名（字符串）
     items = OrderItemSerializer(many=True, read_only=True)  # 嵌套订单项
     status = serializers.SerializerMethodField()  # 自定义：把后端 pending 转成前端 unpaid
 
     class Meta:
         model = Orders
-        fields = ["id", "order_no", "username", "items", "total_amount", "status", "create_time"]
+        fields = ["id", "order_no", "username", "items", "total_amount", "status", "create_time", "address", "shipping_company", "tracking_number"]
 
     def get_status(self, obj):
         # 前端状态值约定是 unpaid，后端模型是 pending，做一次转换

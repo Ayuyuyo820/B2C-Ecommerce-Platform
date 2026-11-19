@@ -1,7 +1,6 @@
 from rest_framework.views import exception_handler
 from rest_framework.response import Response
 
-
 def custom_exception_handler(exc, context):
     # 1. 先让 DRF 处理常见异常（校验失败/404/权限），拿到标准响应
     response = exception_handler(exc, context)

@@ -1,14 +1,16 @@
 import json
 import os
-from asyncio import timeout
-
 from django.utils import timezone
 from uuid import uuid4
-from datetime import timedelta
+from datetime import datetime, time, timedelta, timezone as datetime_timezone
+from hashlib import sha256
 from django.db import transaction
-from django.db.models import Sum, F
+from rest_framework import mixins
+from rest_framework.exceptions import ValidationError
+from django.db.models import Sum, F, Count
+from django.db.models.functions import TruncDate
 from rest_framework.decorators import api_view, permission_classes, action
-from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet  # ReadOnlyModelViewSet只能查看
+from rest_framework.viewsets import GenericViewSet, ModelViewSet, ReadOnlyModelViewSet  # ReadOnlyModelViewSet只能查看
 from rest_framework.permissions import AllowAny, IsAuthenticated, BasePermission
 from rest_framework.response import Response
 from apps.common.pagination import StandardPagination  # 全局分页器（让 page_size 生效）
@@ -19,17 +21,16 @@ from django.utils.text import get_valid_filename
 from django.core.cache import cache  # Django 缓存框架（指向 Redis）
 from apps.users.models import (
     UserInfo,UserAddresses,ProductCategories,Products,CartItem,
-Orders,OrdersItem,Reviews
+Checkout,Orders,OrdersItem,Reviews
 )
 from apps.users.serializers import (
+    OrderShipSerializer,
     UserMeSerializer, UserInfoSerializer,UserAddressesSerializer,
     ProductCategoriesSerializer,ProductsSerializer,CartItemSerializer,
-    OrdersSerializer,ReviewsSerializer,MerchantOrderSerializer,
+    MerchantProductUpdateSerializer, ProductStockAdjustmentSerializer,
+    CheckoutCreateSerializer, OrdersSerializer,ReviewsSerializer,MerchantOrderSerializer,
     AdminUserSerializer, AdminProductSerializer,MerchantReviewSerializer
 )
-
-from django.utils.decorators import method_decorator
-from django.views.decorators.cache import cache_page
 
 '''商家端专用权限：只有 merchant / admin / superadmin 能访问'''
 class IsMerchantOrAdmin(BasePermission):
@@ -175,22 +176,19 @@ def address_detail(request, pk):
         serializer.save()
         return Response(serializer.data)
     return Response(serializer.errors, status=400)
+
 '''商品分类列表'''
-# 请求方法
 @api_view(['GET'])
-@permission_classes([AllowAny]) # 需要游客登录
+@permission_classes([AllowAny]) # 需要登录就能访问
 def categories(request):
-    cache_key = "categories:tree"
-    # 获取缓存通过ID
-    cached = cache.get(cache_key)
-    if cached is not None:
+    cache_key = "category:tree"     # 缓存的 key（实际存成 mall:category:tree）
+    cached = cache.get(cache_key)    # 先查 Redis
+    if cached is not None:  # 命中则直接返回，不再查库
         return Response(cached)
-    # 缓存未命中数据库获取数据
-    cache_list = ProductCategories.objects.filter(parent=None)  # 一级标题
-    serializer = ProductCategoriesSerializer(cache_list,many=True)
-    # 更新缓存
-    cache.set(cache_key,serializer.data,60*60) # 传入三个值，缓存名字，存什么内容，时间
-    return Response(serializer.data)
+    category_list  = ProductCategories.objects.filter(parent = None) # 只查一级分类
+    serializer  = ProductCategoriesSerializer(category_list,many=True)#  many=True 序列化多条数据
+    cache.set(cache_key, serializer.data, timeout=60 * 30)  # 未命中查库后 缓存 30 分钟
+    return  Response(serializer.data)
 '''商品分类详情'''
 @api_view(['GET'])
 @permission_classes([AllowAny])
@@ -230,18 +228,18 @@ class ProductViewSet(ReadOnlyModelViewSet):
     # 序列化
     serializer_class  = ProductsSerializer
     permission_classes = [AllowAny]  # 公开商品
-    # 负责“接收请求、返回商品列表”
-    # 加装饰器缓存整个响应
-    def list(self,request,*args,**kwargs):
-        # 包含分页、筛选参数，避免不同请求混用缓存
-        cache_key  = "product:list" + request.build_absolute_uri()  # 返回当前请求的URL
-        # 获取数据
+    def list(self, request, *args, **kwargs):
+        # 分页链接和图片地址可能包含请求域名。
+        url_hash = sha256(request.build_absolute_uri().encode()).hexdigest()
+        cache_key = f"products:list:{url_hash}"
         cached = cache.get(cache_key)
         if cached is not None:
             return Response(cached)
-        response = super().list(request,*args,**kwargs)
-        cache.set(cache_key,response.data,timeout=60*5)
+
+        response = super().list(request, *args, **kwargs)
+        cache.set(cache_key, response.data, timeout=60 * 5)
         return response
+
     def get_queryset(self):
         # 1、只查上架商品                                #select_related 一次性把关联的数据都查出来
         qs = Products.objects.filter(is_active=True).select_related('category','merchant')  # is_active商品是否上架 category分类 merchant 商家
@@ -276,10 +274,11 @@ class ProductViewSet(ReadOnlyModelViewSet):
         ordering = params.get('ordering')
         # 白名单：只允许这些字段排序，防止传非法字段报 500
         allowed = ["price", "-price", "sales", "-sales", "create_time", "-create_time", "id", "-id"]
+        if ordering in ("id", "-id"):
+            return qs.order_by(ordering)
         if ordering in allowed:
-            qs = qs.order_by(ordering)
-
-        return qs
+            return qs.order_by(ordering, "id")
+        return qs.order_by("id")
         # 查询商品评价列表
     @action(detail=True,methods=["GET"],permission_classes=[AllowAny])
     def reviews(self,request,pk=None):
@@ -314,6 +313,8 @@ POST   /merchant/products/       → 发布商品
 GET    /merchant/products/       → 商品列表
 GET    /merchant/products/{id}/  → 商品详情
 PUT    /merchant/products/{id}/  → 修改商品
+PATCH  /merchant/products/{id}/  → 局部修改商品资料
+POST   /merchant/products/{id}/adjust-stock/  → 增减库存
 DELETE /merchant/products/{id}/  → 删除商品
 '''
 class MerchantProductViewSet(ModelViewSet):
@@ -327,10 +328,37 @@ class MerchantProductViewSet(ModelViewSet):
     def get_queryset(self):
         return Products.objects.filter(merchant=self.request.user)
 
+    def get_serializer_class(self):
+        if self.action in {"update", "partial_update"}:
+            return MerchantProductUpdateSerializer
+        return super().get_serializer_class()
+
     # 创建商品
     def perform_create(self, serializer):
         # 发布商品时自动绑定当前用户为商家
         serializer.save(merchant=self.request.user)
+
+    @action(detail=True, methods=["post"], url_path="adjust-stock")
+    @transaction.atomic
+    def adjust_stock(self, request, pk=None):
+        product = self.get_object()  # 商品必须属于当前商家
+        serializer = ProductStockAdjustmentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        delta = serializer.validated_data["delta"]
+        products = self.get_queryset().filter(pk=product.pk)
+        if delta < 0:
+            products = products.filter(stock__gte=-delta)
+        else:
+            products = products.filter(stock__lte=serializer.MAX_STOCK - delta)
+
+        # 按数据库当前库存增减，库存边界判断和写入由同一条 SQL 完成。
+        updated = products.update(stock=F("stock") + delta, updated_at=timezone.now())
+        if not updated:
+            message = "库存不足，无法减少指定数量" if delta < 0 else "调整后的库存超出上限"
+            raise ValidationError({"delta": message})
+
+        product.refresh_from_db(fields=["stock"])
+        return Response({"stock": product.stock})
 
 '''购物车'''
 class CartItemViewSet(ModelViewSet):
@@ -344,39 +372,46 @@ class CartItemViewSet(ModelViewSet):
     # 获取用户购物车记录
     def get_queryset(self):
         # 购物车列表一次性查出商品信息，减少查询次数
-        return CartItem.objects.filter(user=self.request.user).select_related('product')
-
-
+        queryset = CartItem.objects.filter(user=self.request.user).select_related("product")
+        # DRF 在 perform_update 前查询购物车项，先锁行才能读到上次提交的数量。
+        if self.action in {"update", "partial_update"}:
+            queryset = queryset.select_for_update()
+        return queryset
 
     @transaction.atomic
-    def perform_create(self,serializer):
-        # 取出商品对象和购买数量（数量默认 1）
-        product  = serializer.validated_data['product']
-        quantity = serializer.validated_data.get('quantity',1)
+    def perform_create(self, serializer):
+        product = serializer.validated_data["product"]
+        quantity = serializer.validated_data.get("quantity", 1)
 
-        # get_or_create 原子处理：已有该商品则取出来累加，没有则新建。
-        # 相比 filter().first() + save()，能避免并发加购时触发 unique_together 冲突
-        existing_item, created = CartItem.objects.get_or_create(
+        # 联合唯一约束防止重复创建，行锁让已有记录上的并发累加依次执行。
+        existing_item, created = CartItem.objects.select_for_update().get_or_create(
             user=self.request.user, product=product,
-            defaults={'quantity': quantity, 'total_price': product.price * quantity}
+            defaults={"quantity": quantity, "total_price": product.price * quantity},
         )
 
         if not created:
-            # 已存在 → 累加数量，重新计算总价
             existing_item.quantity += quantity
             existing_item.total_price = product.price * existing_item.quantity
-            existing_item.save()
+            existing_item.save(update_fields=["quantity", "total_price"])
 
-        # 把序列化器实例指向合并后的购物车记录，保证返回最新数量
         serializer.instance = existing_item
 
-    def perform_update(self,serializer):
-        # 1. 保存前端传的数据（quantity、is_selected 等）
-        instance = serializer.save()  # 保存到数据库  更新所有字段
-        # 2. 根据新数量重新计算总价
-        instance.total_price = instance.product.price * instance.quantity
-        # 3. 只更新总价、数量、勾选状态这三个字段
-        instance.save(update_fields=["total_price", "quantity", "is_selected"]) # 只更新指定的字段
+    @transaction.atomic
+    def update(self, request, *args, **kwargs):
+        # 兼容只提交单个字段的 PUT 请求，省略的字段按局部更新处理。
+        kwargs["partial"] = True
+        return super().update(request, *args, **kwargs)
+
+    def perform_update(self, serializer):
+        item = serializer.instance
+        changes = serializer.validated_data.copy()
+        # 改数量时一次写入数量和小计，单独勾选时只写 is_selected。
+        if "quantity" in changes:
+            changes["total_price"] = item.product.price * changes["quantity"]
+        for field, value in changes.items():
+            setattr(item, field, value)
+        if changes:
+            item.save(update_fields=list(changes))
 
     def list(self,request,*args,**kwargs):
         # 第1步：获取当前用户的购物车数据
@@ -410,123 +445,164 @@ class CartItemViewSet(ModelViewSet):
         return Response(status=204)
 
 '''订单模块'''
-class OrdersViewSet(ModelViewSet):
-    queryset = Orders.objects.all() # 获取数据
-    serializer_class = OrdersSerializer # 序列化
-    permission_classes = [IsAuthenticated] # 权限登录才能访问
+class OrdersViewSet(
+    mixins.CreateModelMixin, mixins.ListModelMixin, mixins.RetrieveModelMixin,
+    GenericViewSet,
+):
+    queryset = Orders.objects.all()
+    serializer_class = OrdersSerializer
+    permission_classes = [IsAuthenticated]
 
-    # 默认：Orders.objects.all()  → 能看到所有人的订单
-    # 只能访问自己的
     def get_queryset(self):
-        # select_related 一次性查出关联的商家和地址，prefetch_related  用于反向关系（一对多) 查出订单项里的商品分两次查询，然后在 Python 里拼接
-        qs = Orders.objects.filter(user=self.request.user).select_related("merchant", "address").prefetch_related("items__product")
-        # 支持按状态筛选：/api/v1/orders/?status=paid
+        qs = (
+            Orders.objects.filter(user=self.request.user)
+            .select_related("merchant", "checkout")
+            .prefetch_related("items__product")
+            .order_by("-create_time", "-pk")
+        )
         status = self.request.query_params.get("status")
-        if status:
+        if status and self.action == "list":
             qs = qs.filter(status=status)
         return qs
 
-    # 默认：serializer.save() → 只保存前端传的数据
-    # 问题：订单号谁生成？金额谁计算？购物车谁删？
-    # 所以要重写：
-    @transaction.atomic  # 事务：建订单+建订单项+扣库存+删购物车，任一失败整体回滚，避免脏数据
-    def perform_create(self, serializer):
-        #  生成订单号
-        order_no = f"ORD{timezone.now().strftime('%Y%m%d%H%M%S')}{str(uuid4())[:8]}"
-        # 校验收货地址属于当前用户，防止绑定别人的地址
-        address = serializer.validated_data.get("address")
-        if address and address.user != self.request.user:
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError({"address_id": "收货地址不属于当前用户"})
-        # ② 取购物车商品，select_related 一次性查出商品信息
-        cart_ids = serializer.validated_data.pop("cart_ids") # validated_data 是序列化器校验通过后，整理好的干净数据。
-        # 根据前端传的购物车 ID 列表，查出对应的购物车记录。
-        # select_for_update 悲观锁：锁住购物车行，防止同一购物车被并发重复下单（下单成功后要删除购物车）
-        cart_items = CartItem.objects.filter(id__in=cart_ids, user=self.request.user).select_for_update().select_related("product")
-
-        # ③ 检查购物车是否为空
-        if not cart_items.exists():
-            from rest_framework.exceptions import ValidationError
-            raise ValidationError({"cart_ids": "请至少选择一个购物车商品"})
-
-        # ④ 取第一个商品的商家作为订单商家
-        merchant = cart_items.first().product.merchant
-        # ⑤ 算总金额 → 遍历每个购物车项，算 单价×数量
-        total_amount = sum(item.product.price * item.quantity for item in cart_items)
-
-        # ⑤-1 下单前校验库存是否充足（不足直接报错，不做任何扣减）
-        for item in cart_items:
-            if item.product.stock < item.quantity:
-                from rest_framework.exceptions import ValidationError
-                raise ValidationError({"detail": f"商品「{item.product.name}」库存不足，仅剩 {item.product.stock} 件"})
-
-        # ⑥ 保存订单 → 自动填入 user、merchant、order_no、total_amount
-        order = serializer.save(
-            user=self.request.user,
-            merchant=merchant,
-            order_no=order_no,
-            total_amount=total_amount,
-            status="pending",
-        )
-        # ⑦ 创建订单项 + 原子扣库存
-        # 乐观锁（CAS）：不锁商品行，靠「stock >= 数量」这个条件做原子更新。
-        # F("stock") 直接用数据库当前库存做减法，消除「读-改-写」竞态导致的丢失更新/超卖。
-        # 影响 0 行（updated==0）说明库存已被，并发抢光，报「库存不足」。
-        # stock__gte本质上就是乐观锁（CAS） 防止超卖
-        for item in cart_items:
-            updated = Products.objects.filter(
-                pk=item.product.pk, stock__gte=item.quantity
-            ).update(stock=F("stock") - item.quantity)
-            if updated == 0:
-                from rest_framework.exceptions import ValidationError
-                raise ValidationError({"detail": f"商品「{item.product.name}」库存不足"})
-            OrdersItem.objects.create(
-                order=order,
-                product=item.product,
-                price=item.product.price,  # 记录购买时的价格（防止后续改价）
-                quantity=item.quantity
-            )
-        # ⑧ 删除购物车
-        cart_items.delete()
-    '''自定义接口'''
-    # 支付订单
-    @action(detail=True,methods=["POST"])
-    def pay(self,request,pk=None):
-        order = self.get_object()
-        if order.status != "pending":
-            return Response({"detail":"订单状态不允许支付"},status=400)
-        order.status ='paid'
-        order.pay_time = timezone.now()
-        order.save()
-        serializer = OrdersSerializer(order)
-        return Response(serializer.data)
-
-    # 取消订单
     @transaction.atomic
-    @action(detail=True,methods=["POST"])
-    def cancel(self,request,pk=None):
-        order  = self.get_object()
-        if order.status not in ["pending"]:
-            return  Response({"detail":"订单状态不允许取消"},status=400)
-        order.status = "cancelled"
-        order.save()
-        # 回补库存：取消订单时，原子加回库存（同样用 F() 乐观锁思路，避免并发下加错数量）
-        for item in order.items.select_related("product"):
-            Products.objects.filter(pk=item.product.pk).update(stock=F("stock") + item.quantity)
-        serializer = OrdersSerializer(order)
-        return  Response(serializer.data)
+    def create(self, request, *args, **kwargs):
+        serializer = CheckoutCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        address = UserAddresses.objects.filter(pk=data["address_id"], user=request.user).first()
+        if address is None:
+            raise ValidationError({"address_id": "收货地址不存在或不属于当前用户"})
 
-    # 确认收货
-    @action(detail=True, methods=['post'])
+        if "cart_ids" in data:
+            cart_ids = data["cart_ids"]
+            cart_items = list(
+                CartItem.objects.filter(pk__in=cart_ids, user=request.user)
+                .select_related("product")
+                .order_by("product_id", "pk")
+                .select_for_update()
+            )
+            if len(cart_items) != len(data["cart_ids"]):
+                raise ValidationError({"cart_ids": "购物车商品无效或重复，请刷新后重新选择"})
+            lines = [(item.product, item.quantity) for item in cart_items]
+        else:
+            product = Products.objects.select_for_update().filter(pk=data["product_id"]).first()
+            if product is None:
+                raise ValidationError({"product_id": "商品不存在"})
+            lines = [(product, data["quantity"])]
+
+        items_by_merchant = {}
+        for product, quantity in lines:
+            # 加购后可能发生下架或审核变化，两种结算入口都在此重新校验。
+            # 在创建结算单、订单和扣库存之前拒绝无商家、不可售或数值异常的数据。
+            # 此处库存非负仅检查数据合法性；购买数量是否足够，
+            # 仍由下方 stock__gte=quantity 的条件更新和受影响行数判断。
+            if (
+                not product.merchant_id or not product.is_active
+                or product.audit_status != "approved" or quantity < 1
+                or product.price < 0 or product.stock < 0
+            ):
+                raise ValidationError({"detail": f"商品「{product.name}」无法结算，请检查购物车"})
+            items_by_merchant.setdefault(product.merchant_id, []).append((product, quantity))
+
+        checkout = Checkout.objects.create(
+            user=request.user,
+            total_amount=sum(product.price * quantity for product, quantity in lines),
+            order_count=len(items_by_merchant),
+            address_snapshot={
+                "receiver": address.receiver,
+                "phone": address.phone,
+                "full_address": f"{address.province}{address.city}{address.district}{address.detail}",
+            },
+        )
+        order_ids = []
+        for merchant_id, items in items_by_merchant.items():
+            order = Orders.objects.create(
+                user=request.user,
+                merchant_id=merchant_id,
+                checkout=checkout,
+                order_no=f"ORD{uuid4().hex[:29]}",
+                total_amount=sum(product.price * quantity for product, quantity in items),
+                remark=data["remark"],
+            )
+            order_ids.append(order.pk)
+            for product, quantity in items:
+                updated = Products.objects.filter(
+                    pk=product.pk, stock__gte=quantity,
+                ).update(stock=F("stock") - quantity)
+                if not updated:
+                    raise ValidationError({"detail": f"商品「{product.name}」库存不足"})
+                OrdersItem.objects.create(
+                    order=order, product=product, price=product.price, quantity=quantity,
+                    # 两种结算入口都在这里保存下单时的名称和图片地址。
+                    product_name=product.name, product_image=product.image,
+                )
+
+        if "cart_ids" in data:
+            CartItem.objects.filter(pk__in=cart_ids, user=request.user).delete()
+        orders = self.get_serializer(
+            self.get_queryset().filter(pk__in=order_ids).order_by("pk"), many=True,
+        ).data
+        return Response({**orders[0], "orders": orders}, status=201)
+
+    def _locked_checkout_orders(self, order):
+        orders = Orders.objects.filter(user=self.request.user)
+        if order.checkout_id:
+            checkout = Checkout.objects.select_for_update().get(pk=order.checkout_id)
+            return checkout, orders.filter(checkout=checkout)
+        return None, orders.filter(pk=order.pk)
+
+    @action(detail=True, methods=["POST"])
+    @transaction.atomic
+    def pay(self, request, pk=None):
+        order = self.get_object()
+        checkout, orders = self._locked_checkout_orders(order)
+        if checkout and checkout.pay_time:
+            return Response(self.get_serializer(self.get_object()).data)
+
+        locked_orders = list(orders.select_for_update().order_by("pk"))
+        if any(row.status != "pending" for row in locked_orders):
+            return Response({"detail": "订单状态不允许支付"}, status=400)
+
+        paid_at = timezone.now()
+        orders.update(status="paid", pay_time=paid_at)
+        if checkout:
+            checkout.pay_time = paid_at
+            checkout.save(update_fields=["pay_time"])
+        return Response(self.get_serializer(self.get_object()).data)
+
+    @action(detail=True, methods=["POST"])
+    @transaction.atomic
+    def cancel(self, request, pk=None):
+        order = self.get_object()
+        checkout, orders = self._locked_checkout_orders(order)
+        if checkout and checkout.cancelled_at:
+            return Response(self.get_serializer(self.get_object()).data)
+
+        locked_orders = list(orders.select_for_update().order_by("pk"))
+        if any(row.status != "pending" for row in locked_orders):
+            return Response({"detail": "订单状态不允许取消"}, status=400)
+
+        items = OrdersItem.objects.filter(
+            order_id__in=[row.pk for row in locked_orders], product_id__isnull=False,
+        ).order_by("product_id", "pk")
+        for item in items:
+            Products.objects.filter(pk=item.product_id).update(stock=F("stock") + item.quantity)
+        orders.update(status="cancelled")
+        if checkout:
+            checkout.cancelled_at = timezone.now()
+            checkout.save(update_fields=["cancelled_at"])
+        return Response(self.get_serializer(self.get_object()).data)
+
+    @action(detail=True, methods=["POST"])
     def confirm(self, request, pk=None):
         order = self.get_object()
-        if order.status != 'shipped':
+        updated = Orders.objects.filter(pk=order.pk, user=request.user, status="shipped").update(
+            status="completed", complete_time=timezone.now(),
+        )
+        if not updated:
             return Response({"detail": "订单状态不允许确认收货"}, status=400)
-        order.status = 'completed'
-        order.complete_time = timezone.now()
-        order.save()
-        serializer = OrdersSerializer(order)
-        return Response(serializer.data)
+        return Response(self.get_serializer(self.get_object()).data)
 
     # 发表评价
     @action(detail=True, methods=["POST"])
@@ -649,7 +725,7 @@ def upload(request):
 GET    /merchant/orders/            → 订单列表（仅当前商家的订单）
 POST   /merchant/orders/{id}/ship/  → 发货
 '''
-class MerchantOrdersViewSet(ModelViewSet):
+class MerchantOrdersViewSet(ReadOnlyModelViewSet):
     serializer_class = MerchantOrderSerializer
     permission_classes = [IsAuthenticated, IsMerchantOrAdmin]
 
@@ -659,13 +735,13 @@ class MerchantOrdersViewSet(ModelViewSet):
         if user.role not in ["merchant", "admin", "superadmin"]:
             return Orders.objects.none()
         # 只查 merchant 指向自己的订单
-        qs = Orders.objects.filter(merchant=user).select_related("user").prefetch_related("items__product")
+        qs = Orders.objects.filter(merchant=user).select_related("user", "checkout").prefetch_related("items__product").order_by("-create_time", "-pk")
 
         # 状态筛选：前端传的值和后端模型不同，做映射
         # unpaid(待支付)→pending；pending_ship(待发货)→paid
         status_map = {"unpaid": "pending", "pending_ship": "paid"}
         status = self.request.query_params.get("status")
-        if status:
+        if status and self.action == "list":
             status = status_map.get(status, status)
             qs = qs.filter(status=status)
         return qs
@@ -674,13 +750,15 @@ class MerchantOrdersViewSet(ModelViewSet):
     @action(detail=True, methods=["POST"])
     def ship(self, request, pk=None):
         order = self.get_object()  # 在 get_queryset 过滤后的范围内找，天然只能操作自己的订单
-        if order.status != "paid":
+        serializer = OrderShipSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        # 状态判断与物流信息保存使用同一条 SQL，避免重复发货覆盖单号。
+        updated = Orders.objects.filter(pk=order.pk, merchant=request.user, status="paid").update(
+            status="shipped", ship_time=timezone.now(), **serializer.validated_data,
+        )
+        if not updated:
             return Response({"detail": "订单状态不允许发货"}, status=400)
-        order.status = "shipped"
-        order.ship_time = timezone.now()
-        order.save()
-        serializer = self.get_serializer(order)
-        return Response(serializer.data)
+        return Response(self.get_serializer(self.get_object()).data)
 '''校验是否为管理员，不是则返回 True 表示需要拦截'''
 def is_not_admin(user):
     return user.role not in ['admin','superadmin']
@@ -691,8 +769,10 @@ def is_not_admin(user):
 def admin_user_list(request):
     if is_not_admin(request.user):
         return Response({'detail':'无权限'},status=403)
-    # 获取全部用户数据
+    # 普通管理员只查看用户和商家，后续筛选也在这个权限范围内执行。
     qs = UserInfo.objects.all()
+    if request.user.role == "admin":
+        qs = qs.filter(role__in=["user", "merchant"])
     # 角色筛选
     role = request.query_params.get("role")
     if role:
@@ -708,34 +788,56 @@ def admin_user_list(request):
 
     # 分页
     paginator = StandardPagination()
-    page = paginator.paginate_queryset(qs,request)
+    page = paginator.paginate_queryset(qs.order_by("id"),request)
     serializer = AdminUserSerializer(page, many=True)
     return paginator.get_paginated_response(serializer.data)
+
+def _lock_admin_target(pk):
+    # 两个管理入口都先按 ID 顺序锁超管，再锁目标账号，调用方必须开启事务。
+    # 并发禁用、降级会依次检查，避免各自认为还有其他超管可用。
+    superadmins = list(
+        UserInfo.objects.filter(role="superadmin").order_by("pk").select_for_update()
+    )
+    user = UserInfo.objects.select_for_update().filter(pk=pk).first()
+    active_superadmin_count = sum(admin.is_active for admin in superadmins)
+    return user, active_superadmin_count
+
 
 '''修改用户状态'''
 # 修改用户状态（启用/封禁）
 @api_view(["PATCH"])                      # 只接受 PATCH 请求（改单字段语义）
 @permission_classes([IsAuthenticated])    # 必须登录
+@transaction.atomic
 def admin_user_status(request, pk):
     # 权限校验：只有管理员/超管能操作
     if is_not_admin(request.user):
         return Response({"detail": "无权限"}, status=403)
 
-    # 查 URL 里指定 id 的目标用户；filter 返回一组，first 取第一个
-    # 注意：这里的 pk 是"要操作的用户"，不是登录者自己
-    user = UserInfo.objects.filter(pk=pk).first()
-    if not user:                          # 查不到说明 id 不存在
+    # 必须明确提交 JSON 布尔值，漏传、字符串或数字都返回错误。
+    is_active = request.data.get("is_active")
+    if type(is_active) is not bool:
+        return Response({"detail": "is_active 必须为 true 或 false"}, status=400)
+
+    user, active_superadmin_count = _lock_admin_target(pk)
+    if user is None:
         return Response({"detail": "用户不存在"}, status=404)
 
-    # 从请求体取新的启用状态（前端传 true/false）
-    raw = request.data.get("is_active")
-    # 兼容前端可能传字符串 "false"：字符串按 true/false 解析，其他类型显式转布尔，避免 "false" 被当成真
-    if isinstance(raw, str):
-        is_active = raw.lower() in ("true", "1", "yes")
-    else:
-        is_active = bool(raw)
-    user.is_active = is_active            # 更新字段
-    user.save()                           # 保存到数据库
+    # 等待锁期间操作者可能已被降级或禁用，使用数据库当前权限再次判断。
+    operator_role = (
+        UserInfo.objects.filter(pk=request.user.pk, is_active=True)
+        .values_list("role", flat=True).first()
+    )
+    if operator_role not in ["admin", "superadmin"]:
+        return Response({"detail": "无权限"}, status=403)
+    # 列表隐藏之外，接口也限制目标角色，防止手动指定管理员或超管 ID。
+    if operator_role == "admin" and user.role not in ["user", "merchant"]:
+        return Response({"detail": "只能管理普通用户和商家"}, status=403)
+    if user.role == "superadmin" and user.is_active and not is_active and active_superadmin_count <= 1:
+        return Response({"detail": "至少保留一个启用的超级管理员"}, status=400)
+
+    user.is_active = is_active
+    # 只更新状态，避免覆盖其他账号资料。
+    user.save(update_fields=["is_active"])
 
     # is_active 为 false → 返回"已禁用"；为 true → "已启用"
     return Response({"message": "用户已禁用" if not is_active else "用户已启用"})
@@ -743,21 +845,27 @@ def admin_user_status(request, pk):
 '''分配角色'''
 @api_view(["PUT"])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def admin_user_role(request,pk):
     # 只有超级管理员能改角色
     if request.user.role != 'superadmin':
         return Response({"detail":"无权限"},status=403)
-    # 获取当前用户信息
-    user = UserInfo.objects.filter(pk=pk).first()
-    if not user:
-        return Response({"detail":"用户不存在"},status=404)
     # 获取用户角色
     role = request.data.get('role')
     valid_roles = ['user','merchant','admin','superadmin']
     if role not in valid_roles:
         return Response({"detail":"非法角色"},status=400)
+
+    user, active_superadmin_count = _lock_admin_target(pk)
+    if user is None:
+        return Response({"detail":"用户不存在"},status=404)
+    # 与禁用入口共用锁定顺序，并复核等待期间可能发生的权限变化。
+    if not UserInfo.objects.filter(pk=request.user.pk, role="superadmin", is_active=True).exists():
+        return Response({"detail":"无权限"},status=403)
+    if user.role == "superadmin" and user.is_active and role != "superadmin" and active_superadmin_count <= 1:
+        return Response({"detail": "至少保留一个启用的超级管理员"}, status=400)
     user.role = role
-    user.save()
+    user.save(update_fields=["role"])
     return Response({"message": "角色分配成功", "user": {"id": user.id, "username": user.username, "role": user.role}})
 
 
@@ -769,7 +877,8 @@ def admin_product_audit_list(request):
     if is_not_admin(request.user):
         return Response({"detail":"无权限"},status=403)
     # 获取商家待上架商品
-    qs = Products.objects.select_related('merchant') # 联表查询
+    # 新发布的商品在前，同一发布时间按唯一 ID 排序，保证分页顺序确定。
+    qs = Products.objects.select_related('merchant').order_by('-create_time', '-id')
     status = request.query_params.get('status')
     # 判断商品状态
     if status == 'pending':         # 前端点了「待审核」标签
@@ -811,7 +920,8 @@ def admin_product_audit(request,pk): # 传入商品ID
 
     else:  # 前端传了别的值
         return Response({"detail": "action 参数错误"}, status=400)
-    product.save() # 提交
+    # 审核只写审核相关字段，避免把读取商品时的库存写回数据库。
+    product.save(update_fields=["audit_status", "is_active", "reject_reason", "updated_at"])
     return Response({
         "message": "审核通过" if action == "approve" else "已拒绝",
         "product": {"id": product.id, "is_active": product.is_active}
@@ -824,24 +934,24 @@ def admin_statistics(request):
     # 权限校验：只有管理员/超管能看
     if is_not_admin(request.user):
         return Response({"detail": "无权限"}, status=403)
-    cache_key = 'admin:statistics:daily'
+    today = timezone.localdate()
+    # 新口径使用新版本缓存，并按日期隔离，避免跨午夜读到昨天的数据。
+    cache_key = f'admin:statistics:daily:v2:{today}'
     cached = cache.get(cache_key)
     if cached is not None:
         return  Response(cached)
-    # ① 拿到"今天"的纯日期（去掉时分秒），作为统计基准
-    today = timezone.now().date()
-
-    # ② 今日成交额：筛选"支付时间在今天"的订单，用 Sum 聚合它们的 total_amount 求和
-    #    filter：筛出今天支付的订单
-    #    pay_time__date：只要支付时间的日期部分（把时分秒丢掉再比较）
-    #    Sum("total_amount")：把这些订单的金额全部加起来
-    #    ["total"]：从聚合结果字典里取出求和的数字
-    #    or 0：今天没有支付订单时，Sum 是 None，兜底成 0
-    today_amount = Orders.objects.filter(pay_time__date=today).aggregate(total=Sum("total_amount"))["total"] or 0
+    start_at = timezone.make_aware(datetime.combine(today, time.min))
+    end_at = timezone.make_aware(datetime.combine(today + timedelta(days=1), time.min))
+    # 成交额按支付时间统计，仅包括已支付、已发货、已完成的订单。
+    # 时间范围采用左闭右开，明天零点的数据留给明天。
+    today_amount = Orders.objects.filter(
+        status__in=["paid", "shipped", "completed"],
+        pay_time__gte=start_at, pay_time__lt=end_at,
+    ).aggregate(total=Sum("total_amount"))["total"] or 0
 
     data =  {
         # 今天创建了几个订单（数数）
-        "today_orders": Orders.objects.filter(create_time__date=today).count(),
+        "today_orders": Orders.objects.filter(create_time__gte=start_at, create_time__lt=end_at).count(),
         # 今天成交多少钱（上面算好，转字符串给前端）
         "today_amount": str(today_amount),
         # 平台一共有多少用户（全表数数）
@@ -868,26 +978,53 @@ def admin_sales(request):
     #    显式列出支持的范围，非法值回落默认 7 天，避免悄悄按别的天数算
     PERIOD_MAP = {"7d": 7, "30d": 30, "90d": 90, "1y": 365}
     period = request.query_params.get("period", "7d")
-    days = PERIOD_MAP.get(period, 7)  # get 第二参数=非法值时兜底 7 天
+    if period not in PERIOD_MAP:
+        period = "7d"
+    days = PERIOD_MAP[period]
+    today = timezone.localdate()
 
     # ② 缓存：每个周期单独一个 key（7d/30d/1y 是不同的数据，不能共用），先查 Redis
-    cache_key = f"admin:sales:{period}"
+    cache_key = f"admin:sales:v2:{today}:{period}"
     cached = cache.get(cache_key)
-    if cached is not None:              # 命中就直接返回，不再跑下面 365 天的循环查询
+    if cached is not None:
         return Response(cached)
 
     # ③ 算出起始日期：今天是第 days 天，往前推 days-1 天就是第 1 天
-    start = timezone.now().date() - timedelta(days=days - 1)
+    start = today - timedelta(days=days - 1)
+    start_at = timezone.make_aware(datetime.combine(start, time.min))
+    end_at = timezone.make_aware(datetime.combine(today + timedelta(days=1), time.min))
+    # 项目使用 Asia/Shanghai，统计区间内固定为 +08:00。
+    # 数据库按 UTC 存储，先加北京时间偏移再取日期，避免依赖 MySQL 命名时区表。
+    # TruncDate 指定 UTC，防止 Django 对已经平移的时间再次转换。
+    day_offset = start_at.utcoffset()
+
+    # 下单数按创建时间统计，包含待支付和已取消订单。
+    # values + annotate 让数据库一次返回整个区间的每日数量。
+    order_rows = (
+        Orders.objects.filter(create_time__gte=start_at, create_time__lt=end_at)
+        .annotate(day=TruncDate(F("create_time") + day_offset, tzinfo=datetime_timezone.utc))
+        .values("day").annotate(orders=Count("id")).order_by("day")
+    )
+    # 成交额按支付时间统计，与首页口径一致；金额由数据库 Sum 聚合。
+    amount_rows = (
+        Orders.objects.filter(
+            status__in=["paid", "shipped", "completed"],
+            pay_time__gte=start_at, pay_time__lt=end_at,
+        )
+        .annotate(day=TruncDate(F("pay_time") + day_offset, tzinfo=datetime_timezone.utc))
+        .values("day").annotate(amount=Sum("total_amount")).order_by("day")
+    )
+    orders_by_day = {row["day"]: row["orders"] for row in order_rows}
+    amounts_by_day = {row["day"]: row["amount"] for row in amount_rows}
 
     data = []
-    # ④ 从起始日开始，逐天循环，统计每天的数据
+    # 两次查询已完成，下面只在内存中补齐无数据日期，不再逐日查询数据库。
     for i in range(days):
         d = start + timedelta(days=i)          # 当前是第 i 天的日期
-        day_orders = Orders.objects.filter(create_time__date=d)  # 查"这一天"创建的订单
         data.append({
             "date": d.strftime("%Y-%m-%d"),    # 日期格式化成 2026-08-27 这种字符串
-            "orders": day_orders.count(),      # 这天下了几单
-            "amount": str(sum(o.total_amount for o in day_orders)),  # 这天的订单金额合计
+            "orders": orders_by_day.get(d, 0),
+            "amount": format(amounts_by_day.get(d, 0), ".2f"),
         })
 
     result = {"period": period, "data": data}

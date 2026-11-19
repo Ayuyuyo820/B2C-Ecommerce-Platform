@@ -17,6 +17,9 @@
       <!-- 订单表格 -->
       <el-table :data="orderList" v-loading="loading" stripe border style="width: 100%">
         <el-table-column prop="order_no" label="订单号" min-width="180" />
+        <!-- 展示发货时保存的物流信息，历史订单未填写时为空。 -->
+        <el-table-column prop="shipping_company" label="物流公司" min-width="120" />
+        <el-table-column prop="tracking_number" label="物流单号" min-width="180" />
         <el-table-column prop="username" label="下单用户" min-width="120" />
         <!-- 商品信息列：展示商品名和数量 -->
         <el-table-column label="商品信息" min-width="220" show-overflow-tooltip>
@@ -78,6 +81,12 @@
       >
         <el-form-item label="订单号">
           <el-input :model-value="currentOrder.order_no" disabled />
+        </el-form-item>
+        <el-form-item v-if="currentOrder.address" label="收货信息">
+          <div>
+            <div>{{ currentOrder.address.receiver }} {{ currentOrder.address.phone }}</div>
+            <div>{{ currentOrder.address.full_address }}</div>
+          </div>
         </el-form-item>
         <el-form-item label="物流公司" prop="shipping_company">
           <el-input v-model="shipForm.shipping_company" placeholder="请输入物流公司名称" />

@@ -17,8 +17,9 @@
           <el-option label="全部" value="" />
           <el-option label="用户" value="user" />
           <el-option label="商家" value="merchant" />
-          <el-option label="管理员" value="admin" />
-          <el-option label="超级管理员" value="superadmin" />
+          <!-- 普通管理员的列表仅包含用户和商家，对应筛选项也限制范围。 -->
+          <el-option v-if="isSuperadmin" label="管理员" value="admin" />
+          <el-option v-if="isSuperadmin" label="超级管理员" value="superadmin" />
         </el-select>
         <el-select v-model="searchForm.status" placeholder="状态" clearable style="width: 120px">
           <el-option label="全部" value="" />
@@ -65,6 +66,7 @@
                 {{ row.is_active ? '禁用' : '启用' }}
               </el-button>
               <el-button
+                v-if="isSuperadmin"
                 type="warning"
                 size="small"
                 @click="handleAssignRole(row)"
@@ -114,10 +116,15 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { Search, Refresh } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import request from '@/api/request'
+import { useUserStore } from '@/store/user'
+
+const userStore = useUserStore()
+// 分配角色由超管操作，后端接口仍会独立校验权限。
+const isSuperadmin = computed(() => userStore.userInfo?.role === 'superadmin')
 
 // ========== 搜索表单 ==========
 const searchForm = reactive({

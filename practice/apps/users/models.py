@@ -85,6 +85,19 @@ class Products(models.Model):
     create_time = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
     updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
 
+    class Meta:
+        # 数据库兜底保护 ORM update() 等绕过接口校验的写入。
+        # CheckConstraint 由迁移创建到数据库，直接写入负值也会被拒绝。
+        # 原价可为 NULL，填写时要求 >= 0；库存为 0 表示售罄。
+        constraints = [
+            models.CheckConstraint(check=models.Q(price__gte=0), name="product_price_gte_0"),
+            models.CheckConstraint(check=models.Q(stock__gte=0), name="product_stock_gte_0"),
+            models.CheckConstraint(
+                check=models.Q(original_price__isnull=True) | models.Q(original_price__gte=0),
+                name="product_original_price_gte_0",
+            ),
+        ]
+
     def __str__(self):
         return self.name
 
@@ -100,13 +113,35 @@ class CartItem(models.Model):
     # 联合唯一
     class Meta:
         unique_together = ["user","product"]
+        # 禁止直接写入零或负数量，保留原有用户与商品联合唯一约束。
+        # 该约束保证数据库中的购物车数量始终 >= 1。
+        # 删除购物车项使用 DELETE，数量不能通过设为 0 表示删除。
+        constraints = [
+            models.CheckConstraint(check=models.Q(quantity__gte=1), name="cart_quantity_gte_1"),
+        ]
 
     # 结构化中文
     def __str__(self):
         return f"{self.user.username} - {self.product.name}"
 
 '''订单模块'''
+class Checkout(models.Model):
+    user = models.ForeignKey(UserInfo, on_delete=models.CASCADE)
+    total_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    address_snapshot = models.JSONField()
+    order_count = models.PositiveIntegerField()
+    pay_time = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+
+
 class Orders(models.Model):
+    # 历史订单留空，新发货时校验并保存物流信息。
+    shipping_company = models.CharField(max_length=100, blank=True, default="", verbose_name="物流公司")
+    tracking_number = models.CharField(max_length=100, blank=True, default="", verbose_name="物流单号")
+    checkout = models.ForeignKey(
+        Checkout, on_delete=models.RESTRICT, null=True, blank=True, related_name="orders"
+    )
+    legacy_address_snapshot = models.JSONField(null=True, blank=True)
     # 订单状态
     STATUS_CHOICES = [
         ('pending', '待支付'),
@@ -135,13 +170,16 @@ class Orders(models.Model):
 
 '''订单项（一个订单包含多个商品）'''
 class OrdersItem(models.Model):
+    # 下单时复制商品资料，历史订单展示使用订单项快照。
+    product_name = models.CharField(max_length=128, default="", blank=True, verbose_name="下单时商品名称")
+    product_image = models.URLField(max_length=500, default="", blank=True, verbose_name="下单时商品图片")
     order = models.ForeignKey(Orders, on_delete=models.CASCADE, related_name='items', verbose_name="订单")
     product = models.ForeignKey(Products,on_delete=models.SET_NULL,null=True)
     price =   models.DecimalField(max_digits=10,decimal_places=2,verbose_name="购买时单价")
     quantity = models.IntegerField(default=1,verbose_name="数量")
 
     def __str__(self):
-        return f"{self.order.order_no} - {self.product.name}"
+        return f"{self.order.order_no} - {self.product_name or '商品已删除'}"
 
 '''评价模块'''
 class Reviews(models.Model):
